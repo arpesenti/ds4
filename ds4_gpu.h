@@ -286,6 +286,27 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* Fully fused decode kernel: RoPE (tail) + FP8 E4M3 KV quantize + F16 raw
+ * store in a single kernel launch.  Replaces three separate dispatches
+ * (rope_tail, fp8_kv_quantize, store_raw_kv) in the single-token decode
+ * path, eliminating two memory round-trips per layer. */
+int ds4_gpu_rope_fp8_kv_store_raw_fused_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          raw_row,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          n_ctx_orig,
+        uint32_t          pos,
+        int               inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
 /* Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
  * ds4_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
  * explicitly selected by the graph driver. */
@@ -579,6 +600,16 @@ int ds4_gpu_swiglu_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *up,
+        uint32_t                n,
+        float                   clamp,
+        float                   weight);
+
+/* Fused SwiGLU + element-wise add: SwiGLU(gate, up) + add */
+int ds4_gpu_swiglu_add_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *add,
         uint32_t                n,
         float                   clamp,
         float                   weight);

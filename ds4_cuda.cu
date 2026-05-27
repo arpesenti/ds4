@@ -1622,7 +1622,16 @@ __global__ static void matmul_f16_kernel(
     float sum = 0.0f;
     const __half *wr = w + row * in_dim;
     const float *xr = x + tok * in_dim;
-    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+    /* Use half2 vectorized loads for pairs of F16 weights */
+    const uint64_t half_pairs = in_dim / 2u;
+    for (uint64_t i = threadIdx.x; i < half_pairs; i += blockDim.x) {
+        const half2 wh = *(const half2 *)(wr + i * 2u);
+        const float xi = xr[i * 2u];
+        const float xi1 = xr[i * 2u + 1];
+        sum += __half2float(wh.x) * xi + __half2float(wh.y) * xi1;
+    }
+    /* Handle odd element if needed */
+    for (uint64_t i = half_pairs * 2u + threadIdx.x; i < in_dim; i += blockDim.x) {
         sum += __half2float(wr[i]) * xr[i];
     }
 
@@ -1635,6 +1644,10 @@ __global__ static void matmul_f16_kernel(
     }
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
+
+/* Forward declarations for warp reduction helpers (defined later) */
+__device__ static float warp_sum_f32(float v);
+__device__ static float warp_max_f32(float v);
 
 __global__ static void matmul_f16_serial_kernel(
         float *out,
@@ -1656,7 +1669,37 @@ __global__ static void matmul_f16_serial_kernel(
     out[tok * out_dim + row] = sum;
 }
 
-__global__ static void matmul_f16_ordered_chunks_kernel(
+/* Warp-level F16 matmul kernel optimized for decode (single token, many rows).
+ * Uses half2 vectorized loads and warp-shuffle reduction (no shared memory). */
+__global__ static void matmul_f16_warp_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+
+    float sum = 0.0f;
+    const __half *wr = w + row * in_dim;
+    const float *xr = x;
+    /* half2 vectorized loads */
+    const uint64_t half_pairs = in_dim / 2u;
+    for (uint64_t i = lane; i < half_pairs; i += 32u) {
+        const half2 wh = *(const half2 *)(wr + i * 2u);
+        const float xi = xr[i * 2u];
+        const float xi1 = xr[i * 2u + 1];
+        sum += __half2float(wh.x) * xi + __half2float(wh.y) * xi1;
+    }
+    for (uint64_t i = half_pairs * 2u + lane; i < in_dim; i += 32u) {
+        sum += __half2float(wr[i]) * xr[i];
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0) out[row] = sum;
+}
+
+__global__ static DS4_CUDA_UNUSED void matmul_f16_ordered_chunks_kernel(
         float *out,
         const __half *w,
         const float *x,
@@ -1688,7 +1731,52 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
-__global__ static void matmul_f16_pair_ordered_chunks_kernel(
+/* Warp-level F16 pair matmul kernel for decode: two GEMMs from the same input.
+ * Uses half2 loads and warp-shuffle reduction. */
+__global__ static void matmul_f16_pair_warp_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out0_dim && row >= out1_dim) return;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
+    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
+    const uint64_t half_pairs = in_dim / 2u;
+    for (uint64_t i = lane; i < half_pairs; i += 32u) {
+        const float xi = x[i * 2u];
+        const float xi1 = x[i * 2u + 1];
+        if (row < out0_dim) {
+            const half2 wh = *(const half2 *)(wr0 + i * 2u);
+            sum0 += __half2float(wh.x) * xi + __half2float(wh.y) * xi1;
+        }
+        if (row < out1_dim) {
+            const half2 wh = *(const half2 *)(wr1 + i * 2u);
+            sum1 += __half2float(wh.x) * xi + __half2float(wh.y) * xi1;
+        }
+    }
+    for (uint64_t i = half_pairs * 2u + lane; i < in_dim; i += 32u) {
+        const float xv = x[i];
+        if (row < out0_dim) sum0 += __half2float(wr0[i]) * xv;
+        if (row < out1_dim) sum1 += __half2float(wr1[i]) * xv;
+    }
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+    if (lane == 0) {
+        if (row < out0_dim) out0[row] = sum0;
+        if (row < out1_dim) out1[row] = sum1;
+    }
+}
+
+__global__ static DS4_CUDA_UNUSED void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
         const __half *w0,
@@ -1711,7 +1799,25 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
     if (k1 > in_dim) k1 = in_dim;
     const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
     const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
-    for (uint64_t i = k0; i < k1; i++) {
+    /* Use half2 vectorized loads for pairs of F16 weights */
+    const uint64_t half_pairs = k1 - k0 >= 2u ? (k1 - k0) / 2u : 0u;
+    const __half2 *wr0h = row < out0_dim ? (const __half2 *)(wr0 + k0) : (const __half2 *)w0;
+    const __half2 *wr1h = row < out1_dim ? (const __half2 *)(wr1 + k0) : (const __half2 *)w1;
+    const float *xrb = x + k0;
+    for (uint64_t i = 0; i < half_pairs; i++) {
+        const float xi = xrb[i * 2u];
+        const float xi1 = xrb[i * 2u + 1];
+        if (row < out0_dim) {
+            const half2 wh = wr0h[i];
+            sum0 += __half2float(wh.x) * xi + __half2float(wh.y) * xi1;
+        }
+        if (row < out1_dim) {
+            const half2 wh = wr1h[i];
+            sum1 += __half2float(wh.x) * xi + __half2float(wh.y) * xi1;
+        }
+    }
+    /* Handle odd element if needed */
+    for (uint64_t i = k0 + half_pairs * 2u; i < k1; i++) {
         const float xv = x[i];
         if (row < out0_dim) sum0 += __half2float(wr0[i]) * xv;
         if (row < out1_dim) sum1 += __half2float(wr1[i]) * xv;
@@ -2558,6 +2664,80 @@ __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, ui
     uint32_t t = gid / head_dim;
     uint32_t row = (pos0 + t) % raw_cap;
     raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
+}
+
+/* =================================================================
+ * Fused decode kernel: RoPE (tail) + FP8 E4M3 KV quantize + raw
+ * F16 store.  Replaces three separate kernel launches in the single-
+ * token decode path with one, eliminating two memory round-trips.
+ * ================================================================= */
+__global__ static void rope_fp8_kv_store_raw_fused_kernel(
+        float *kv,                    /* in-place: FP8 quantize nope portion */
+        float *raw_cache,             /* F16-rounded output stored here */
+        uint32_t raw_cap,
+        uint32_t raw_row,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t n_ctx_orig,
+        uint32_t pos,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n_nope = head_dim - n_rot;
+
+    /* --- RoPE on the tail (rotated) portion --- */
+    if (d < n_rot / 2u) {
+        uint32_t i = d * 2u;
+
+        float corr0 = 0.0f, corr1 = 0.0f;
+        if (ext_factor != 0.0f) {
+            float denom = 2.0f * logf(freq_base);
+            corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+            corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+            corr0 = fmaxf(0.0f, corr0);
+            corr1 = fminf((float)(n_rot - 1), corr1);
+        }
+
+        float theta_extrap = (float)pos * powf(freq_base, -((float)i) / (float)n_rot);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        float c = cosf(theta) * mscale;
+        float s = sinf(theta) * mscale;
+        if (inverse) s = -s;
+
+        float *tail = kv + n_nope + i;
+        float x0 = tail[0];
+        float x1 = tail[1];
+        tail[0] = x0 * c - x1 * s;
+        tail[1] = x0 * s + x1 * c;
+    }
+    __syncthreads();
+
+    /* --- FP8 E4M3 quantize on the nope (non-rotated) portion + F16 store --- */
+    if (d < head_dim) {
+        float v = kv[d];
+        if (d < n_nope) {
+            /* FP8 quantize */
+            float av = fabsf(v);
+            /* Find optimal power-of-2 scale so that quantized value covers the dynamic range */
+            float scale = exp2f(ceilf(log2f(fmaxf(av, 1.0e-4f) / 448.0f)));
+            v = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
+            kv[d] = v;
+        }
+        /* F16 round and store to raw cache */
+        raw_cache[(uint64_t)raw_row * head_dim + d] = __half2float(__float2half(v));
+    }
 }
 
 __global__ static void attention_prefill_raw_kernel(
@@ -3940,11 +4120,26 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     float *sp = split + (uint64_t)t * mix_hc;
     if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
     __syncthreads();
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < 4; h++) {
-            acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * sp[h];
-        }
+    /* Vectorized weighted sum with float4 loads for coalesced memory access */
+    const float s0 = sp[0], s1 = sp[1], s2 = sp[2], s3 = sp[3];
+    const float4 *r0 = (const float4 *)(residual_hc + (uint64_t)t * 4u * n_embd);
+    const float4 *r1 = (const float4 *)(residual_hc + (uint64_t)t * 4u * n_embd + n_embd);
+    const float4 *r2 = (const float4 *)(residual_hc + (uint64_t)t * 4u * n_embd + (uint64_t)2u * n_embd);
+    const float4 *r3 = (const float4 *)(residual_hc + (uint64_t)t * 4u * n_embd + (uint64_t)3u * n_embd);
+    float4 *o4 = (float4 *)out;
+    for (uint32_t col = d; col < n_embd / 4u; col += blockDim.x) {
+        float4 v0 = r0[col], v1 = r1[col], v2 = r2[col], v3 = r3[col];
+        o4[col].x = v0.x * s0 + v1.x * s1 + v2.x * s2 + v3.x * s3;
+        o4[col].y = v0.y * s0 + v1.y * s1 + v2.y * s2 + v3.y * s3;
+        o4[col].z = v0.z * s0 + v1.z * s1 + v2.z * s2 + v3.z * s3;
+        o4[col].w = v0.w * s0 + v1.w * s1 + v2.w * s2 + v3.w * s3;
+    }
+    /* Handle remaining elements if n_embd is not divisible by 4 */
+    for (uint32_t col = (n_embd / 4u) * 4u + d; col < n_embd; col += blockDim.x) {
+        float acc = residual_hc[(uint64_t)t * 4u * n_embd + col] * s0 +
+                    residual_hc[(uint64_t)t * 4u * n_embd + n_embd + col] * s1 +
+                    residual_hc[(uint64_t)t * 4u * n_embd + 2u * n_embd + col] * s2 +
+                    residual_hc[(uint64_t)t * 4u * n_embd + 3u * n_embd + col] * s3;
         out[(uint64_t)t * n_embd + col] = acc;
     }
 }
@@ -3972,12 +4167,29 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
     __syncthreads();
 
+    /* Vectorized weighted sum with float4 loads */
+    const float s0 = sp[0], s1 = sp[1], s2 = sp[2], s3 = sp[3];
+    const float4 *r0 = (const float4 *)(residual_hc + (uint64_t)t * 4u * n_embd);
+    const float4 *r1 = (const float4 *)(residual_hc + (uint64_t)t * 4u * n_embd + n_embd);
+    const float4 *r2 = (const float4 *)(residual_hc + (uint64_t)t * 4u * n_embd + (uint64_t)2u * n_embd);
+    const float4 *r3 = (const float4 *)(residual_hc + (uint64_t)t * 4u * n_embd + (uint64_t)3u * n_embd);
+    float4 *o4 = (float4 *)out;
     float sum = 0.0f;
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < 4; h++) {
-            acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * sp[h];
-        }
+    for (uint32_t col = d; col < n_embd / 4u; col += blockDim.x) {
+        float4 v0 = r0[col], v1 = r1[col], v2 = r2[col], v3 = r3[col];
+        float4 acc;
+        acc.x = v0.x * s0 + v1.x * s1 + v2.x * s2 + v3.x * s3;
+        acc.y = v0.y * s0 + v1.y * s1 + v2.y * s2 + v3.y * s3;
+        acc.z = v0.z * s0 + v1.z * s1 + v2.z * s2 + v3.z * s3;
+        acc.w = v0.w * s0 + v1.w * s1 + v2.w * s2 + v3.w * s3;
+        o4[col] = acc;
+        sum += acc.x * acc.x + acc.y * acc.y + acc.z * acc.z + acc.w * acc.w;
+    }
+    for (uint32_t col = (n_embd / 4u) * 4u + d; col < n_embd; col += blockDim.x) {
+        float acc = residual_hc[(uint64_t)t * 4u * n_embd + col] * s0 +
+                    residual_hc[(uint64_t)t * 4u * n_embd + n_embd + col] * s1 +
+                    residual_hc[(uint64_t)t * 4u * n_embd + 2u * n_embd + col] * s2 +
+                    residual_hc[(uint64_t)t * 4u * n_embd + 3u * n_embd + col] * s3;
         out[(uint64_t)t * n_embd + col] = acc;
         sum += acc * acc;
     }
@@ -3990,9 +4202,19 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         __syncthreads();
     }
     const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        const float v = out[(uint64_t)t * n_embd + col];
-        norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
+    /* Vectorized norm output with float4 stores */
+    const float4 *nw4 = (const float4 *)norm_w;
+    float4 *no4 = (float4 *)norm_out;
+    for (uint32_t col = d; col < n_embd / 4u; col += blockDim.x) {
+        float4 v = o4[col];
+        float4 nw = nw4[col];
+        no4[col].x = v.x * norm_scale * nw.x;
+        no4[col].y = v.y * norm_scale * nw.y;
+        no4[col].z = v.z * norm_scale * nw.z;
+        no4[col].w = v.w * norm_scale * nw.w;
+    }
+    for (uint32_t col = (n_embd / 4u) * 4u + d; col < n_embd; col += blockDim.x) {
+        norm_out[(uint64_t)t * n_embd + col] = out[(uint64_t)t * n_embd + col] * norm_scale * norm_w[col];
     }
 }
 
@@ -4432,6 +4654,20 @@ __global__ static void swiglu_kernel(float *out, const float *gate, const float 
     }
     float s = g / (1.0f + expf(-g));
     out[i] = s * u * weight;
+}
+
+/* Fused SwiGLU + element-wise add: computes SwiGLU(gate, up) + add in one pass */
+__global__ static void swiglu_add_kernel(float *out, const float *gate, const float *up, const float *add, uint32_t n, float clamp, float weight) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    float u = up[i];
+    if (clamp > 1.0e-6f) {
+        g = fminf(g, clamp);
+        u = fminf(fmaxf(u, -clamp), clamp);
+    }
+    float s = g / (1.0f + expf(-g));
+    out[i] = s * u * weight + add[i];
 }
 
 __global__ static void add_kernel(float *out, const float *a, const float *b, uint32_t n) {
@@ -6142,6 +6378,12 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         matmul_f16_serial_kernel<<<grid, 1>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
     }
+    /* Use warp-optimized kernel for decode path (single token) */
+    if (n_tok == 1u && getenv("DS4_CUDA_NO_WARP_F16_MATMUL") == NULL) {
+        uint32_t blocks = (uint32_t)((out_dim + 7u) / 8u);
+        matmul_f16_warp_kernel<<<blocks, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_warp launch");
+    }
     if (ordered_router) {
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
@@ -6189,7 +6431,8 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
-    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
+    uint32_t blocks = (uint32_t)((out_dim + 7u) / 8u);
+    matmul_f16_pair_warp_kernel<<<blocks, 256>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
         w0,
@@ -6198,7 +6441,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         in_dim,
         out_dim,
         out_dim);
-    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+    return cuda_ok(cudaGetLastError(), "matmul_f16_pair_warp launch");
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -6371,6 +6614,33 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          n_rot) {
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
            ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
+}
+extern "C" int ds4_gpu_rope_fp8_kv_store_raw_fused_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          raw_row,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          n_ctx_orig,
+        uint32_t          pos,
+        int               inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow) {
+    if (!kv || !raw_cache || raw_cap == 0 || n_rot > head_dim || (n_rot & 1) ||
+        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    rope_fp8_kv_store_raw_fused_kernel<<<(head_dim + 255) / 256, 256>>>(
+            (float *)kv->ptr,
+            (float *)raw_cache->ptr,
+            raw_cap, raw_row, head_dim, n_rot,
+            n_ctx_orig, pos, inverse,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "rope_fp8_kv_store_raw_fused launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
@@ -7578,6 +7848,15 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
         up->bytes < (uint64_t)n * sizeof(float)) return 0;
     swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
+}
+extern "C" int ds4_gpu_swiglu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, const ds4_gpu_tensor *add, uint32_t n, float clamp, float weight) {
+    if (!out || !gate || !up || !add ||
+        out->bytes < (uint64_t)n * sizeof(float) ||
+        gate->bytes < (uint64_t)n * sizeof(float) ||
+        up->bytes < (uint64_t)n * sizeof(float) ||
+        add->bytes < (uint64_t)n * sizeof(float)) return 0;
+    swiglu_add_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, (const float *)add->ptr, n, clamp, weight);
+    return cuda_ok(cudaGetLastError(), "swiglu_add launch");
 }
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,

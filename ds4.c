@@ -9681,6 +9681,42 @@ static bool metal_graph_decode_kv_store(
                                              DS4_N_ROT) != 0;
 }
 
+/* Fused decode KV store: RoPE (tail) + FP8 quantize + F16 raw cache store
+ * in a single kernel launch.  Call this instead of the separate RoPE +
+ * KV store dispatches in the single-token decode path. */
+static bool metal_graph_decode_rope_fp8_kv_store(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          raw_row,
+        uint32_t          n_ctx_orig,
+        uint32_t          pos,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor) {
+    if (metal_graph_use_reference_kv_decode()) {
+        return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0 &&
+               ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM) != 0;
+    }
+
+    return ds4_gpu_rope_fp8_kv_store_raw_fused_tensor(kv,
+                                                        raw_cache,
+                                                        raw_cap,
+                                                        raw_row,
+                                                        DS4_N_HEAD_DIM,
+                                                        DS4_N_ROT,
+                                                        n_ctx_orig,
+                                                        pos,
+                                                        false,
+                                                        freq_base,
+                                                        freq_scale,
+                                                        ext_factor,
+                                                        attn_factor,
+                                                        DS4_ROPE_YARN_BETA_FAST,
+                                                        DS4_ROPE_YARN_BETA_SLOW) != 0;
+}
+
 static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
     return (uint64_t)DS4_N_HEAD_DIM *
            (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
@@ -9965,18 +10001,13 @@ static bool metal_graph_encode_decode_layer(
             metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
         }
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("KVrope", g->kv, DS4_N_HEAD_DIM, il, pos);
-    }
-    /* RoPE stays as the exact standalone kernel above.  The decode fusion
-     * starts after that, where FP8 KV quantization and raw-cache storage can
-     * share one pass without changing the trigonometric path. */
-    if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+    /* Fused RoPE + FP8 KV quantize + F16 raw cache store: replaces the
+     * separate rope_tail_tensor + decode_kv_store dispatches with a single
+     * kernel launch, eliminating two memory round-trips in the decode path. */
+    if (ok) ok = metal_graph_decode_rope_fp8_kv_store(g->kv, raw_cache, raw_cap, raw_row,
+                                                        compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                        pos, freq_base, freq_scale,
+                                                        ext_factor, attn_factor);
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
